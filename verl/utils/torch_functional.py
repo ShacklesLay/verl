@@ -96,17 +96,16 @@ def logprobs_from_logits(logits, labels, inplace_backward=True, return_full_logp
 
     if return_full_logprobs:
         if topk_for_kl is not None:
-            # Memory-efficient: only return top-k logprobs
-            # Get top-k values and indices
-            topk_logits, topk_indices = torch.topk(logits, k=topk_for_kl, dim=-1)
-            # Compute log_softmax only on top-k
-            topk_log_probs = F.log_softmax(topk_logits, dim=-1)
-            # Also compute selected token log_probs using full softmax
-            full_log_probs_for_selected = F.log_softmax(logits, dim=-1)
-            selected_log_probs = gather_from_labels(full_log_probs_for_selected, labels)
+            # Memory-efficient: compute full softmax once, then extract top-k
+            # This preserves original distribution probabilities for top-k subset
+            full_log_probs = F.log_softmax(logits, dim=-1)  # [batch, seq, vocab]
+            # Extract top-k logprobs and indices from the full distribution
+            topk_log_probs, topk_indices = torch.topk(full_log_probs, k=topk_for_kl, dim=-1)
+            # Selected token log_probs can reuse full_log_probs
+            selected_log_probs = gather_from_labels(full_log_probs, labels)
             return {
                 'log_probs': selected_log_probs,
-                'full_log_probs': topk_log_probs,  # [batch, seq, topk]
+                'full_log_probs': topk_log_probs,  # [batch, seq, topk] from full softmax
                 'topk_indices': topk_indices  # [batch, seq, topk]
             }
         else:

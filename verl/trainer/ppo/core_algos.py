@@ -1492,7 +1492,7 @@ def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTenso
         # Check if logprob already contains pre-computed top-k (memory-efficient mode)
         # In this case, logprob is a dict with 'log_probs', 'full_log_probs' (top-k), and 'topk_indices'
         if isinstance(logprob, dict) and 'topk_indices' in logprob:
-            # Memory-efficient path: logprob already contains top-k
+            # Memory-efficient path: logprob already contains top-k from full softmax
             topk_log_probs = logprob['full_log_probs']  # [batch, seq, k]
             topk_idx = logprob['topk_indices']  # [batch, seq, k]
             topk_probs = torch.exp(topk_log_probs)
