@@ -84,33 +84,43 @@ class DataParallelPPOActor(BasePPOActor):
         self.device_name = get_device_name()
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
+        self, micro_batch, temperature, calculate_entropy=False,
+        return_full_logprobs=None, topk_for_kl=None
     ) -> tuple[torch.Tensor, torch.Tensor | dict]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len) or dict with 'selected' and 'full' keys
                       # Returns dict when kl_loss_type requires full distributions
+        
+        Args:
+            return_full_logprobs: Optional override to return full log_probs (from meta_info)
+            topk_for_kl: Optional override for top-k size (from meta_info)
         """
         response_length = micro_batch["responses"].size(-1)
 
         # Check if we need full log_probs for KL penalty
-        needs_full_logprobs = (
-            hasattr(self.config, 'use_kl_loss') and
-            self.config.use_kl_loss and
-            hasattr(self.config, 'kl_loss_type') and
-            self.config.kl_loss_type in ("full", "top-k", "top-k-unnorm")
-        )
+        # Priority: parameter > config
+        if return_full_logprobs is not None:
+            needs_full_logprobs = return_full_logprobs
+        else:
+            needs_full_logprobs = (
+                hasattr(self.config, 'use_kl_loss') and
+                self.config.use_kl_loss and
+                hasattr(self.config, 'kl_loss_type') and
+                self.config.kl_loss_type in ("full", "top-k", "top-k-unnorm")
+            )
         
         # Determine topk_for_kl for memory efficiency
-        topk_for_kl = None
-        if needs_full_logprobs and hasattr(self.config, 'kl_loss_type'):
+        # Priority: parameter > config
+        if topk_for_kl is None and needs_full_logprobs and hasattr(self.config, 'kl_loss_type'):
             if self.config.kl_loss_type in ("top-k", "top-k-unnorm") and hasattr(self.config, 'kl_topk_size'):
                 topk_for_kl = self.config.kl_topk_size
-                # Use print for visibility in Ray logs
-                if not hasattr(self, '_topk_logged'):
-                    print(f"[TOP-K KL ENABLED] Using top-k={topk_for_kl} for memory-efficient KL computation")
-                    self._topk_logged = True
+        
+        # Use print for visibility in Ray logs
+        if needs_full_logprobs and topk_for_kl is not None and not hasattr(self, '_topk_logged'):
+            print(f"[TOP-K KL ENABLED] Using top-k={topk_for_kl} for memory-efficient KL computation")
+            self._topk_logged = True
         
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -379,6 +389,10 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        # Read optional parameters for full log_probs and top-k (passed by compute_ref_log_prob)
+        return_full_logprobs = data.meta_info.get("return_full_logprobs", None)
+        topk_for_kl = data.meta_info.get("kl_topk_size", None)
+        
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -398,7 +412,8 @@ class DataParallelPPOActor(BasePPOActor):
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
+                    return_full_logprobs=return_full_logprobs, topk_for_kl=topk_for_kl
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
