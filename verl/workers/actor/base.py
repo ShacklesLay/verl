@@ -36,17 +36,22 @@ class BasePPOActor(ABC):
         self.config = config
 
     @abstractmethod
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
-        """Compute logits given a batch of data.
+    def compute_log_prob(self, data: DataProto, return_full_logprobs: bool = False):
+        """Compute log probabilities given a batch of data.
 
         Args:
             data (DataProto): a batch of data represented by DataProto. It must contain key ```input_ids```,
                 ```attention_mask``` and ```position_ids```.
+            return_full_logprobs (bool): If True, return dict with full vocab distributions.
+                                         If False (default), return only selected token log probs.
 
         Returns:
-            DataProto: a DataProto containing the key ```log_probs```
-
-
+            If return_full_logprobs=False (default):
+                torch.Tensor: log_probs with shape [batch, seq] - selected token log probs
+            If return_full_logprobs=True:
+                dict: Dictionary with keys:
+                    'log_probs': [batch, seq] - selected token log probs
+                    'full_log_probs': [batch, seq, vocab] - full distributions
         """
         pass
 

@@ -61,7 +61,7 @@ def gather_from_labels(data, label):
     return output
 
 
-def logprobs_from_logits(logits, labels, inplace_backward=True):
+def logprobs_from_logits(logits, labels, inplace_backward=True, return_full_logprobs=False, topk_for_kl=None):
     """
     Compute per-token log-probabilities for the given labels.
 
@@ -74,22 +74,64 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
         logits (Tensor): Model outputs of shape (..., vocab_size).
         labels (LongTensor): True class indices of shape matching logits[..., :-1].
         inplace_backward (bool): If True and Flash-Attn is available, perform backward in-place.
+        return_full_logprobs (bool): If True, return full log_softmax distribution or top-k.
+        topk_for_kl (int, optional): If set, only return top-k logprobs instead of full vocab.
+                                     Saves memory for top-k KL computation.
 
     Returns:
-        Tensor: Log-probabilities of the target labels, shape logits.shape[:-1].
+        If return_full_logprobs=False (default):
+            Tensor: Log-probabilities of the target labels, shape logits.shape[:-1].
+        If return_full_logprobs=True and topk_for_kl is None:
+            dict: {
+                'log_probs': Tensor of shape logits.shape[:-1] - selected token log probs,
+                'full_log_probs': Tensor of shape logits.shape - full log softmax distribution
+            }
+        If return_full_logprobs=True and topk_for_kl is not None:
+            dict: {
+                'log_probs': Tensor of shape logits.shape[:-1] - selected token log probs,
+                'full_log_probs': Tensor of shape (..., topk_for_kl) - top-k log probs,
+                'topk_indices': Tensor of shape (..., topk_for_kl) - indices of top-k tokens
+            }
     """
-    if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
-        batch_dim = logits.shape[:-1]
-        last_dim = logits.shape[-1]
-        logits = logits.reshape(-1, last_dim)
-        labels = labels.reshape(-1)
-        output = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
-        output = output.view(*batch_dim)
-    elif NPU_CROSS_ENTROPY_LOSS_AVAILABLE:
-        output = logprobs_from_logits_torch_npu(logits, labels)
+
+    if return_full_logprobs:
+        if topk_for_kl is not None:
+            # Memory-efficient: only return top-k logprobs
+            # Get top-k values and indices
+            topk_logits, topk_indices = torch.topk(logits, k=topk_for_kl, dim=-1)
+            # Compute log_softmax only on top-k
+            topk_log_probs = F.log_softmax(topk_logits, dim=-1)
+            # Also compute selected token log_probs using full softmax
+            full_log_probs_for_selected = F.log_softmax(logits, dim=-1)
+            selected_log_probs = gather_from_labels(full_log_probs_for_selected, labels)
+            return {
+                'log_probs': selected_log_probs,
+                'full_log_probs': topk_log_probs,  # [batch, seq, topk]
+                'topk_indices': topk_indices  # [batch, seq, topk]
+            }
+        else:
+            # Original behavior: return full vocab distribution
+            full_log_probs = F.log_softmax(logits, dim=-1)
+            # Also compute selected token log_probs
+            selected_log_probs = gather_from_labels(full_log_probs, labels)
+            return {
+                'log_probs': selected_log_probs,
+                'full_log_probs': full_log_probs
+            }
     else:
-        output = logprobs_from_logits_v2(logits, labels)
-    return output
+        # Current standard behavior (use optimized implementations)
+        if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
+            batch_dim = logits.shape[:-1]
+            last_dim = logits.shape[-1]
+            logits = logits.reshape(-1, last_dim)
+            labels = labels.reshape(-1)
+            output = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
+            output = output.view(*batch_dim)
+        elif NPU_CROSS_ENTROPY_LOSS_AVAILABLE:
+            output = logprobs_from_logits_torch_npu(logits, labels)
+        else:
+            output = logprobs_from_logits_v2(logits, labels)
+        return output
 
 
 def logprobs_from_logits_flash_attn(logits, labels, inplace_backward=True):
@@ -419,23 +461,35 @@ def remove_pad_token(input_ids: torch.Tensor, attention_mask: torch.Tensor):
     return no_padding_batch
 
 
-def log_probs_from_logits_response(input_ids, logits, response_length):
+def log_probs_from_logits_response(input_ids, logits, response_length, return_full_logprobs=False):
     """Compute the response log_probs from full logits. Note that logits = model(input_ids)
 
     Args:
         input_ids: [batch_size, seqlen]
         logits: [batch_size, seqlen, vocab_size]
+        response_length: int
+        return_full_logprobs: bool, if True return full log softmax distribution
 
     Returns:
-        response_log_prob:
+        If return_full_logprobs=False:
+            response_log_prob: [batch_size, response_length]
+        If return_full_logprobs=True:
+            dict: {
+                'log_probs': [batch_size, response_length],
+                'full_log_probs': [batch_size, response_length, vocab_size]
+            }
     """
     response_logits = logits[:, -response_length - 1 : -1]
     response = input_ids[:, -response_length:]
-    response_log_prob = logprobs_from_logits(logits=response_logits, labels=response)
+    response_log_prob = logprobs_from_logits(
+        logits=response_logits,
+        labels=response,
+        return_full_logprobs=return_full_logprobs
+    )
     return response_log_prob
 
 
-def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad, response_length):
+def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad, response_length, return_full_logprobs=False):
     """Compute the log_probs from logits with rmpad logits and pad input. Note that
     logits_rmpad = model(input_ids_rmpad). For each sentences, there is a shift between
     logits and input_ids.
@@ -447,6 +501,16 @@ def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad
         attention_mask: [batch_size, seqlen]
         logits_rmpad: [total_nnz, vocab_size]
         response_length: int
+        return_full_logprobs: bool, if True return full log softmax distribution
+
+    Returns:
+        If return_full_logprobs=False:
+            output: [batch_size, response_length]
+        If return_full_logprobs=True:
+            dict: {
+                'log_probs': [batch_size, response_length],
+                'full_log_probs': [batch_size, response_length, vocab_size]
+            }
     """
     from flash_attn.bert_padding import pad_input, unpad_input
 
@@ -454,15 +518,42 @@ def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad
     input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask=attention_mask)
     input_ids_rmpad = input_ids_rmpad.squeeze(-1)
     input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=0)
-    full_log_probs_rmpad = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)  # (total_nnz,)
-    full_output = pad_input(
-        hidden_states=full_log_probs_rmpad.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
-    )
-    output = full_output.squeeze(-1)[:, -response_length - 1 : -1]  # [batch_size, response_length]
-    return output
+    full_log_probs_rmpad = logprobs_from_logits(
+        logits=logits_rmpad,
+        labels=input_ids_rmpad_rolled,
+        return_full_logprobs=return_full_logprobs
+    )  # (total_nnz,) or dict
+
+    if return_full_logprobs:
+        # Pad both selected and full log_probs
+        selected_log_probs_rmpad = full_log_probs_rmpad['log_probs']  # (total_nnz,)
+        full_dist_rmpad = full_log_probs_rmpad['full_log_probs']  # (total_nnz, vocab)
+
+        selected_output = pad_input(
+            hidden_states=selected_log_probs_rmpad.unsqueeze(-1),
+            indices=indices,
+            batch=batch_size,
+            seqlen=seqlen
+        )
+        full_output = pad_input(
+            hidden_states=full_dist_rmpad,
+            indices=indices,
+            batch=batch_size,
+            seqlen=seqlen
+        )
+        return {
+            'log_probs': selected_output.squeeze(-1)[:, -response_length - 1 : -1],
+            'full_log_probs': full_output[:, -response_length - 1 : -1, :]
+        }
+    else:
+        full_output = pad_input(
+            hidden_states=full_log_probs_rmpad.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
+        )
+        output = full_output.squeeze(-1)[:, -response_length - 1 : -1]  # [batch_size, response_length]
+        return output
 
 
-def log_probs_from_logits_all_rmpad(input_ids_rmpad, logits_rmpad, indices, batch_size, seqlen, response_length):
+def log_probs_from_logits_all_rmpad(input_ids_rmpad, logits_rmpad, indices, batch_size, seqlen, response_length, return_full_logprobs=False):
     """Compute the log_probs from logits with rmpad input_ids and logits. Note that
     logits_rmpad = model(input_ids_rmpad). For each sentences, there is a shift between
     logits and input_ids.
@@ -476,18 +567,55 @@ def log_probs_from_logits_all_rmpad(input_ids_rmpad, logits_rmpad, indices, batc
         batch_size: int
         seqlen: int
         response_length: int
+        return_full_logprobs: bool, if True return full log softmax distribution
+
+    Returns:
+        If return_full_logprobs=False:
+            output: [batch_size, response_length]
+        If return_full_logprobs=True:
+            dict: {
+                'log_probs': [batch_size, response_length],
+                'full_log_probs': [batch_size, response_length, vocab_size]
+            }
     """
     from flash_attn.bert_padding import pad_input
 
     input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # transpose back to [total_nnz, 1]
     input_ids_rmpad = input_ids_rmpad.squeeze(-1)
     input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=0)
-    full_log_probs_rmpad = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)  # (total_nnz,)
-    full_output = pad_input(
-        hidden_states=full_log_probs_rmpad.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
-    )
-    output = full_output.squeeze(-1)[:, -response_length - 1 : -1]  # [batch_size, response_length]
-    return output
+    full_log_probs_rmpad = logprobs_from_logits(
+        logits=logits_rmpad,
+        labels=input_ids_rmpad_rolled,
+        return_full_logprobs=return_full_logprobs
+    )  # (total_nnz,) or dict
+
+    if return_full_logprobs:
+        # Pad both selected and full log_probs
+        selected_log_probs_rmpad = full_log_probs_rmpad['log_probs']  # (total_nnz,)
+        full_dist_rmpad = full_log_probs_rmpad['full_log_probs']  # (total_nnz, vocab)
+
+        selected_output = pad_input(
+            hidden_states=selected_log_probs_rmpad.unsqueeze(-1),
+            indices=indices,
+            batch=batch_size,
+            seqlen=seqlen
+        )
+        full_output = pad_input(
+            hidden_states=full_dist_rmpad,
+            indices=indices,
+            batch=batch_size,
+            seqlen=seqlen
+        )
+        return {
+            'log_probs': selected_output.squeeze(-1)[:, -response_length - 1 : -1],
+            'full_log_probs': full_output[:, -response_length - 1 : -1, :]
+        }
+    else:
+        full_output = pad_input(
+            hidden_states=full_log_probs_rmpad.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
+        )
+        output = full_output.squeeze(-1)[:, -response_length - 1 : -1]  # [batch_size, response_length]
+        return output
 
 
 def post_process_logits(input_ids, logits, temperature, top_k, top_p):

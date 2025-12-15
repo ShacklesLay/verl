@@ -68,7 +68,9 @@ class AlgoConfig(BaseConfig):
         adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
-        kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
+        kl_penalty (str): How to estimate KL divergence: "kl"/"k1", "abs", "mse"/"k2", "low_var_kl"/"k3", "full", "top-k", or "top-k-unnorm".
+        kl_topk_size (Optional[int]): Number of top tokens to consider for top-k and top-k-unnorm KL computation.
+            Required when using kl_penalty="top-k" or "top-k-unnorm".
         kl_ctrl (KLControlConfig): KL control configuration.
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
@@ -89,9 +91,20 @@ class AlgoConfig(BaseConfig):
     norm_adv_by_std_in_grpo: bool = True
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
+    kl_topk_size: Optional[int] = None
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        # Validate that kl_topk_size is set when using top-k KL penalty variants
+        if self.kl_penalty in ("top-k", "top-k-unnorm"):
+            if self.kl_topk_size is None or self.kl_topk_size <= 0:
+                raise ValueError(
+                    f"kl_penalty='{self.kl_penalty}' requires kl_topk_size to be set to a positive integer. "
+                    f"Got kl_topk_size={self.kl_topk_size}"
+                )
     filter_groups: Optional[FilterGroupsConfig] = None
     # Rollout Importance Sampling
     # Controls computation of IS weights and mismatch metrics

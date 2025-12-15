@@ -85,13 +85,33 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | dict]:
         """
         Returns:
             entropy: # (bs, response_len)
-            log_probs: # (bs, response_len)
+            log_probs: # (bs, response_len) or dict with 'selected' and 'full' keys
+                      # Returns dict when kl_loss_type requires full distributions
         """
         response_length = micro_batch["responses"].size(-1)
+
+        # Check if we need full log_probs for KL penalty
+        needs_full_logprobs = (
+            hasattr(self.config, 'use_kl_loss') and
+            self.config.use_kl_loss and
+            hasattr(self.config, 'kl_loss_type') and
+            self.config.kl_loss_type in ("full", "top-k", "top-k-unnorm")
+        )
+        
+        # Determine topk_for_kl for memory efficiency
+        topk_for_kl = None
+        if needs_full_logprobs and hasattr(self.config, 'kl_loss_type'):
+            if self.config.kl_loss_type in ("top-k", "top-k-unnorm") and hasattr(self.config, 'kl_topk_size'):
+                topk_for_kl = self.config.kl_topk_size
+                # Use print for visibility in Ray logs
+                if not hasattr(self, '_topk_logged'):
+                    print(f"[TOP-K KL ENABLED] Using top-k={topk_for_kl} for memory-efficient KL computation")
+                    self._topk_logged = True
+        
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -186,12 +206,15 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
-                    if calculate_entropy:
+                    if calculate_entropy or needs_full_logprobs:
                         inplace_backward = False
+
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
+                        return_full_logprobs=needs_full_logprobs,
+                        topk_for_kl=topk_for_kl,
                     )
 
                     # compute entropy
@@ -206,12 +229,26 @@ class DataParallelPPOActor(BasePPOActor):
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
                     # gather and unpad for the ulysses sp
-                    log_probs = gather_outputs_and_unpad(
-                        log_probs,
-                        gather_dim=0,
-                        unpad_dim=0,
-                        padding_size=pad_size,
-                    )
+                    if needs_full_logprobs:
+                        log_probs['log_probs'] = gather_outputs_and_unpad(
+                            log_probs['log_probs'],
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                        log_probs['full_log_probs'] = gather_outputs_and_unpad(
+                            log_probs['full_log_probs'],
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                    else:
+                        log_probs = gather_outputs_and_unpad(
+                            log_probs,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                     if calculate_entropy:
                         entropy_rmpad = gather_outputs_and_unpad(
                             entropy_rmpad,
@@ -227,17 +264,37 @@ class DataParallelPPOActor(BasePPOActor):
                         batch=batch_size,
                         seqlen=seqlen,
                     )
-                full_log_probs = pad_input(
-                    hidden_states=log_probs.unsqueeze(-1),
-                    indices=indices,
-                    batch=batch_size,
-                    seqlen=seqlen,
-                )
+                if needs_full_logprobs:
+                    full_log_probs_selected = pad_input(
+                        hidden_states=log_probs['log_probs'].unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    full_log_probs_full = pad_input(
+                        hidden_states=log_probs['full_log_probs'],
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                else:
+                    full_log_probs = pad_input(
+                        hidden_states=log_probs.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
 
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if needs_full_logprobs:
+                    log_probs = {
+                        'log_probs': full_log_probs_selected.squeeze(-1)[:, -response_length - 1 : -1],
+                        'full_log_probs': full_log_probs_full[:, -response_length - 1 : -1, :]  # Keep vocab dim
+                    }
+                else:
+                    log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -263,7 +320,11 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    log_probs = logprobs_from_logits(
+                        logits, micro_batch["responses"], 
+                        return_full_logprobs=needs_full_logprobs,
+                        topk_for_kl=topk_for_kl
+                    )
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -343,13 +404,28 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
-        log_probs = torch.concat(log_probs_lst, dim=0)
+        # Handle both tensor and dict cases for concatenation
+        if log_probs_lst and isinstance(log_probs_lst[0], dict):
+            log_probs = {
+                'log_probs': torch.concat([lp['log_probs'] for lp in log_probs_lst], dim=0),
+                'full_log_probs': torch.concat([lp['full_log_probs'] for lp in log_probs_lst], dim=0)
+            }
+        else:
+            log_probs = torch.concat(log_probs_lst, dim=0)
+        
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
 
         if use_dynamic_bsz:
-            log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+            # Handle both tensor and dict cases for dynamic batch restoration
+            if isinstance(log_probs, dict):
+                log_probs = {
+                    'log_probs': restore_dynamic_batch(log_probs['log_probs'], batch_idx_list),
+                    'full_log_probs': restore_dynamic_batch(log_probs['full_log_probs'], batch_idx_list)
+                }
+            else:
+                log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
@@ -432,7 +508,8 @@ class DataParallelPPOActor(BasePPOActor):
                         old_log_prob = model_inputs["old_log_probs"]
                     else:
                         if on_policy:
-                            old_log_prob = log_prob.detach()
+                            old_log_prob_raw = log_prob['log_probs'] if isinstance(log_prob, dict) else log_prob
+                            old_log_prob = old_log_prob_raw.detach()
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
@@ -452,10 +529,13 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
+                    # For PG loss, use selected token log_probs
+                    log_prob_for_pg = log_prob['log_probs'] if isinstance(log_prob, dict) else log_prob
+
                     # Compute policy loss (all functions return 4 values)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
-                        log_prob=log_prob,
+                        log_prob=log_prob_for_pg,
                         advantages=advantages,
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
@@ -473,9 +553,27 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
+
+                        # For KL loss, use appropriate log_probs based on KL type
+                        # For full/top-k/top-k-unnorm: use full distribution
+                        # For standard types: use selected token log_probs
+                        if isinstance(log_prob, dict):
+                            log_prob_for_kl = log_prob['full_log_probs']
+                            # Print shape info for verification (only once)
+                            if not hasattr(self, '_shape_logged'):
+                                print(f"[TOP-K KL] log_prob type: dict with 'full_log_probs' shape: {log_prob_for_kl.shape}")
+                                if 'topk_indices' in log_prob:
+                                    print(f"[TOP-K KL] Using memory-efficient mode with pre-computed top-k indices")
+                                self._shape_logged = True
+                        else:
+                            log_prob_for_kl = log_prob
+
                         # compute kl loss
                         kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            logprob=log_prob_for_kl,
+                            ref_logprob=ref_log_prob,
+                            kl_penalty=self.config.kl_loss_type,
+                            config=self.config
                         )
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 

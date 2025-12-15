@@ -23,10 +23,13 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
+import logging
 
 import numpy as np
 import torch
 from omegaconf import DictConfig
+
+logger = logging.getLogger(__name__)
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
@@ -1391,7 +1394,7 @@ def compute_value_loss(
     return vf_loss, vf_clipfrac
 
 
-def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
+def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty, config=None) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
     kl penalty compute method for unbiased KL gradient estimation.
     See more description in http://joschu.net/blog/kl-approx.html
@@ -1399,11 +1402,13 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     Args:
         logprob:
         ref_logprob:
+        kl_penalty: Type of KL penalty
+        config: Optional config object (required for top-k variants)
 
     Returns:
         kl_estimate
     """
-    forward_score = kl_penalty_forward(logprob, ref_logprob, kl_penalty)
+    forward_score = kl_penalty_forward(logprob, ref_logprob, kl_penalty, config)
     if not kl_penalty.endswith("+") or kl_penalty in ("mse", "k2"):
         return forward_score
 
@@ -1416,19 +1421,32 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
 
     return backward_score - backward_score.detach() + forward_score.detach()
 
-
-def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
+def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty, config=None) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob.
     Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1104
     See more description in http://joschu.net/blog/kl-approx.html
 
+    Supports both 2D [batch, seq] and 3D [batch, seq, vocab] inputs.
+
     Args:
-        logprob:
-        ref_logprob:
+        logprob: Log probabilities from policy.
+                 Shape: [batch, seq] for k1/k2/k3/abs
+                 Shape: [batch, seq, vocab] for full/top-k/top-k-unnorm
+        ref_logprob: Log probabilities from reference policy (same shape as logprob)
+        kl_penalty: Type of KL penalty
+        config: Optional config object with kl_topk_size attribute
 
     Returns:
-        kl_estimate
+        kl_estimate: Shape [batch, seq]
     """
+    # Add shape verification for top-k variants
+    if kl_penalty in ("top-k", "top-k-unnorm", "full"):
+        assert logprob.dim() == 3, f"{kl_penalty} requires 3D input [batch, seq, vocab], got shape {logprob.shape}"
+        assert ref_logprob.dim() == 3, f"{kl_penalty} requires 3D ref input [batch, seq, vocab], got shape {ref_logprob.shape}"
+        logger.debug(f"[{kl_penalty.upper()}] Input shapes verified: logprob={logprob.shape}, ref_logprob={ref_logprob.shape}")
+        if kl_penalty in ("top-k", "top-k-unnorm") and config is not None:
+            logger.debug(f"[{kl_penalty.upper()}] k={config.kl_topk_size}")
+    
     if kl_penalty in ("kl", "k1"):
         return logprob - ref_logprob
 
@@ -1449,10 +1467,90 @@ def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTenso
         return torch.clamp(kld, min=-10, max=10)
 
     if kl_penalty == "full":
-        # so, here logprob and ref_logprob should contain the logits for every token in vocabulary
-        raise NotImplementedError
+        # Full KL: KL(π || π_ref) = sum_v π(v) * log(π(v) / π_ref(v))
+        # Input shape: [batch, seq, vocab]
+        # Output shape: [batch, seq]
+        eps = 1e-10
+        probs = torch.exp(logprob)  # Convert to probabilities
+        # Numerical stability: clamp to avoid log(0) and prevent overflow
+        log_ratio = logprob - ref_logprob
+        log_ratio = torch.clamp(log_ratio, min=-20, max=20)
+        kl = torch.sum(probs * log_ratio, dim=-1)
+        return torch.clamp(kl, min=-10, max=10)
+    
+    if kl_penalty == "top-k":
+        # Top-k KL with renormalization
+        # 1. Select top-k from policy
+        # 2. Renormalize to sum to 1
+        # 3. Compute KL on renormalized distribution
+        if config is None or not hasattr(config, 'kl_topk_size'):
+            raise ValueError("kl_penalty='top-k' requires config.kl_topk_size to be set")
 
-    raise NotImplementedError
+        k = config.kl_topk_size
+        eps = 1e-10
+
+        # Check if logprob already contains pre-computed top-k (memory-efficient mode)
+        # In this case, logprob is a dict with 'log_probs', 'full_log_probs' (top-k), and 'topk_indices'
+        if isinstance(logprob, dict) and 'topk_indices' in logprob:
+            # Memory-efficient path: logprob already contains top-k
+            topk_log_probs = logprob['full_log_probs']  # [batch, seq, k]
+            topk_idx = logprob['topk_indices']  # [batch, seq, k]
+            topk_probs = torch.exp(topk_log_probs)
+            
+            # Gather corresponding ref log probs using the same indices
+            ref_topk_log_probs = torch.gather(ref_logprob, dim=-1, index=topk_idx)
+            ref_topk_probs = torch.exp(ref_topk_log_probs)
+        else:
+            # Original path: compute top-k from full distribution
+            # Get top-k from policy: [batch, seq, k]
+            topk_log_probs, topk_idx = torch.topk(logprob, k, dim=-1)
+            topk_probs = torch.exp(topk_log_probs)
+
+            # Gather corresponding ref log probs
+            ref_topk_log_probs = torch.gather(ref_logprob, dim=-1, index=topk_idx)
+            ref_topk_probs = torch.exp(ref_topk_log_probs)
+
+        # Renormalize top-k probabilities
+        topk_probs_sum = torch.sum(topk_probs, dim=-1, keepdim=True).clamp(min=eps)
+        topk_probs_norm = topk_probs / topk_probs_sum
+        topk_log_probs_norm = torch.log(topk_probs_norm.clamp(min=eps))
+
+        # Renormalize ref probabilities on same subset
+        ref_topk_probs_sum = torch.sum(ref_topk_probs, dim=-1, keepdim=True).clamp(min=eps)
+        ref_topk_probs_norm = ref_topk_probs / ref_topk_probs_sum
+        ref_topk_log_probs_norm = torch.log(ref_topk_probs_norm.clamp(min=eps))
+
+        # Compute KL: sum_k p_norm(k) * log(p_norm(k) / q_norm(k))
+        log_ratio = topk_log_probs_norm - ref_topk_log_probs_norm
+        log_ratio = torch.clamp(log_ratio, min=-20, max=20)
+        kl = torch.sum(topk_probs_norm * log_ratio, dim=-1)
+        return torch.clamp(kl, min=-10, max=10)
+
+    if kl_penalty == "top-k-unnorm":
+        # Top-k KL without renormalization
+        # 1. Select top-k from policy
+        # 2. Directly use original probabilities (no renorm)
+        # 3. Compute KL on subset
+        if config is None or not hasattr(config, 'kl_topk_size'):
+            raise ValueError("kl_penalty='top-k-unnorm' requires config.kl_topk_size to be set")
+
+        k = config.kl_topk_size
+        eps = 1e-10
+
+        # Get top-k from policy: [batch, seq, k]
+        topk_log_probs, topk_idx = torch.topk(logprob, k, dim=-1)
+        topk_probs = torch.exp(topk_log_probs)
+
+        # Gather corresponding ref log probs
+        ref_topk_log_probs = torch.gather(ref_logprob, dim=-1, index=topk_idx)
+
+        # Compute KL: sum_k p(k) * log(p(k) / q(k))
+        log_ratio = topk_log_probs - ref_topk_log_probs
+        log_ratio = torch.clamp(log_ratio, min=-20, max=20)
+        kl = torch.sum(topk_probs * log_ratio, dim=-1)
+        return torch.clamp(kl, min=-10, max=10)
+
+    raise NotImplementedError(f"Unknown kl_penalty type: {kl_penalty}")
 
 
 def compute_pf_ppo_reweight_data(

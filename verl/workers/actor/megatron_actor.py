@@ -491,8 +491,19 @@ class MegatronPPOActor(BasePPOActor):
             else:
                 if self.config.use_kl_loss:
                     ref_log_prob = data["ref_log_prob"]
+
+                    # Note: For full/top-k/top-k-unnorm KL penalty types, log_prob and ref_log_prob
+                    # should have shape [batch, response_length, vocab_size].
+                    # For standard types (k1/k2/k3/abs), shape [batch, response_length] is used.
+                    # Ensure your rollout phase provides the correct shape based on kl_loss_type.
+
                     # compute kl loss
-                    kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
+                    kld = kl_penalty(
+                        logprob=log_prob,
+                        ref_logprob=ref_log_prob,
+                        kl_penalty=self.config.kl_loss_type,
+                        config=self.config
+                    )
                     kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
 
                     policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef

@@ -974,6 +974,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            # Extract tensor from dict if needed (for top-k KL)
+            if isinstance(output, dict):
+                output = output['log_probs']  # Use selected token log_probs for old_log_probs
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
@@ -995,12 +998,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        # Determine if we need full log_probs based on actor's KL loss type
+        kl_loss_type = getattr(self.config.actor, 'kl_loss_type', 'kl')
+        return_full_logprobs = kl_loss_type in ("full", "top-k", "top-k-unnorm")
+
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
+            data.meta_info["return_full_logprobs"] = return_full_logprobs
+            # Pass kl_topk_size for top-k KL computation
+            if kl_loss_type in ("top-k", "top-k-unnorm") and hasattr(self.config.actor, 'kl_topk_size'):
+                data.meta_info["kl_topk_size"] = self.config.actor.kl_topk_size
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
-            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
+            # Extract tensor from dict if needed
+            old_log_probs = data.batch["old_log_probs"]
+            if isinstance(old_log_probs, dict):
+                old_log_probs = old_log_probs['full_log_probs'] if return_full_logprobs else old_log_probs['log_probs']
+            data = DataProto.from_dict(tensors={"ref_log_prob": old_log_probs})
             return data
         assert self._is_ref
         # else:
@@ -1011,9 +1026,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        data.meta_info["return_full_logprobs"] = return_full_logprobs
+        # Pass kl_topk_size for top-k KL computation
+        if kl_loss_type in ("top-k", "top-k-unnorm") and hasattr(self.config.actor, 'kl_topk_size'):
+            data.meta_info["kl_topk_size"] = self.config.actor.kl_topk_size
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
             output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            # Extract tensor from dict if needed
+            if isinstance(output, dict):
+                output = output['full_log_probs'] if return_full_logprobs else output['log_probs']
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
         output = output.to("cpu")

@@ -710,6 +710,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
     @DistProfiler.annotate(color="olive")
     def compute_ref_log_prob(self, data: DataProto):
+        # Determine if we need full log_probs based on actor's KL loss type
+        kl_loss_type = getattr(self.config.actor, 'kl_loss_type', 'kl')
+        return_full_logprobs = kl_loss_type in ("full", "top-k", "top-k-unnorm")
+
         assert self._is_ref
         if self._ref_is_offload_param:
             load_megatron_model_to_gpu(self.ref_module, load_grad=False)
@@ -719,7 +723,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["return_full_logprobs"] = return_full_logprobs
+        # Pass kl_topk_size for top-k KL computation
+        if kl_loss_type in ("top-k", "top-k-unnorm") and hasattr(self.config.actor, 'kl_topk_size'):
+            data.meta_info["kl_topk_size"] = self.config.actor.kl_topk_size
         output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        # Extract tensor from dict if needed
+        if isinstance(output, dict):
+            output = output['full_log_probs'] if return_full_logprobs else output['log_probs']
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
         if self._ref_is_offload_param:
@@ -742,6 +753,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        # Extract tensor from dict if needed (for top-k KL)
+        if isinstance(output, dict):
+            output = output['log_probs']  # Use selected token log_probs for old_log_probs
         output = DataProto.from_dict(
             tensors={"old_log_probs": output, "entropys": entropys},
             meta_info={"temperature": self.config.rollout.temperature},

@@ -102,13 +102,30 @@ class NaiveRollout(BaseRollout):
         logits = torch.stack(logits_lst, dim=1)  # (bs, response_length, vocab_size)
         prompts = idx[:, :prompt_length]  # (bs, prompt_length)
         response = idx[:, prompt_length:]  # (bs, response_length)
-        log_probs = logprobs_from_logits(logits=logits, labels=response)
+
+        # Determine if we need full log_probs based on KL penalty type
+        kl_penalty = getattr(self.config, 'algorithm', None)
+        if kl_penalty is not None:
+            kl_penalty = getattr(kl_penalty, 'kl_penalty', None)
+
+        needs_full_logprobs = kl_penalty in ("full", "top-k", "top-k-unnorm")
+
+        if needs_full_logprobs:
+            log_probs_result = logprobs_from_logits(
+                logits=logits,
+                labels=response,
+                return_full_logprobs=True
+            )
+            old_log_probs = log_probs_result['full_log_probs']  # [bs, response_length, vocab]
+        else:
+            old_log_probs = logprobs_from_logits(logits=logits, labels=response)  # [bs, response_length]
+
         batch = TensorDict(
             {
                 "input_ids": prompts,
                 "responses": response,
                 "sequences": idx,
-                "old_log_probs": log_probs,
+                "old_log_probs": old_log_probs,  # Shape depends on kl_penalty type
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
             },

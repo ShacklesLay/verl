@@ -97,8 +97,18 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     # add kl loss
     if config.use_kl_loss:
         ref_log_prob = data["ref_log_prob"]
+
+        # Note: For full/top-k/top-k-unnorm KL penalty types, log_prob and ref_log_prob
+        # should have shape [batch, response_length, vocab_size].
+        # For standard types (k1/k2/k3/abs), shape [batch, response_length] is used.
+
         # compute kl loss
-        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
+        kld = kl_penalty(
+            logprob=log_prob,
+            ref_logprob=ref_log_prob,
+            kl_penalty=config.kl_loss_type,
+            config=config
+        )
         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode)
 
         policy_loss += kl_loss * config.kl_loss_coef

@@ -57,6 +57,9 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
+import logging
+
+logger = logging.getLogger(__name__)
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -119,7 +122,7 @@ class ResourcePoolManager:
             )
 
 
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", config=None):
     """Apply KL penalty to the token-level rewards.
 
     This function computes the KL divergence between the reference policy and current policy,
@@ -129,6 +132,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         data (DataProto): The data containing batched model outputs and inputs.
         kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
         kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
+        config (optional): Config object with kl_topk_size attribute (required for top-k variants).
 
     Returns:
         tuple: A tuple containing:
@@ -139,11 +143,36 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
 
+    # Note: For full/top-k/top-k-unnorm KL penalty types, old_log_probs and ref_log_prob
+    # should have shape [batch, response_length, vocab_size].
+    # For standard types (k1/k2/k3/abs), shape [batch, response_length] is used.
+
+    # Log input shapes for top-k variants
+    old_log_probs = data.batch["old_log_probs"]
+    ref_log_prob = data.batch["ref_log_prob"]
+    
+    if kl_penalty in ("top-k", "top-k-unnorm", "full"):
+        logger.info(f"[{kl_penalty.upper()} KL] old_log_probs shape: {old_log_probs.shape}")
+        logger.info(f"[{kl_penalty.upper()} KL] ref_log_prob shape: {ref_log_prob.shape}")
+        if kl_penalty in ("top-k", "top-k-unnorm") and config is not None:
+            logger.info(f"[{kl_penalty.upper()} KL] k={config.kl_topk_size}")
+
     # compute kl between ref_policy and current policy
     # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
     kld = core_algos.kl_penalty(
-        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+        old_log_probs,
+        ref_log_prob,
+        kl_penalty=kl_penalty,
+        config=config
     )  # (batch_size, response_length)
+    
+    # Log KL statistics for top-k variants
+    if kl_penalty in ("top-k", "top-k-unnorm", "full"):
+        logger.info(f"[{kl_penalty.upper()} KL] mean: {kld.mean().item():.4f}, "
+                   f"std: {kld.std().item():.4f}, "
+                   f"min: {kld.min().item():.4f}, "
+                   f"max: {kld.max().item():.4f}")
+    
     kld = kld * response_mask
     beta = kl_ctrl.value
 
@@ -341,6 +370,35 @@ class RayPPOTrainer:
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+            logger.info(f"✓ KL in reward ENABLED: kl_penalty={self.config.algorithm.kl_penalty}")
+            if self.config.algorithm.kl_penalty in ("top-k", "top-k-unnorm"):
+                logger.info(f"✓ Using top-k KL with k={self.config.algorithm.kl_topk_size}")
+
+        # Print configuration summary for visibility
+        import sys
+        print("\n" + "="*80)
+        print("VERL CONFIGURATION SUMMARY")
+        print("="*80)
+        if hasattr(self.config, 'actor_rollout_ref') and hasattr(self.config.actor_rollout_ref, 'actor'):
+            actor_config = self.config.actor_rollout_ref.actor
+            if hasattr(actor_config, 'use_kl_loss') and actor_config.use_kl_loss:
+                print(f"✓ Actor KL Loss: ENABLED")
+                print(f"  - KL Type: {getattr(actor_config, 'kl_loss_type', 'NOT SET')}")
+                print(f"  - KL Coef: {getattr(actor_config, 'kl_loss_coef', 'NOT SET')}")
+                if hasattr(actor_config, 'kl_topk_size'):
+                    print(f"  - Top-K Size: {actor_config.kl_topk_size}")
+                    print(f"  ✓ MEMORY OPTIMIZATION: Using top-{actor_config.kl_topk_size} instead of full vocab")
+                else:
+                    print(f"  ⚠ WARNING: kl_topk_size not set, will use full vocab (may OOM)")
+            else:
+                print(f"✗ Actor KL Loss: DISABLED")
+
+        if self.config.algorithm.use_kl_in_reward:
+            print(f"✓ In-Reward KL: ENABLED (kl_penalty={self.config.algorithm.kl_penalty})")
+        else:
+            print(f"✗ In-Reward KL: DISABLED")
+        print("="*80 + "\n")
+        sys.stdout.flush()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1206,8 +1264,23 @@ class RayPPOTrainer:
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
+                            # First-step verification for top-k KL
+                            if self.global_steps == 1 and self.config.algorithm.kl_penalty in ("top-k", "top-k-unnorm", "full"):
+                                ref_log_prob = batch.batch.get("ref_log_prob")
+                                old_log_probs = batch.batch.get("old_log_probs")
+                                if ref_log_prob is not None:
+                                    expected_dims = 3
+                                    actual_dims = ref_log_prob.dim()
+                                    assert actual_dims == expected_dims, \
+                                        f"ERROR: {self.config.algorithm.kl_penalty} requires {expected_dims}D ref_log_prob, got shape {ref_log_prob.shape}"
+                                    logger.info(f"✓ VERIFIED: ref_log_prob has correct {expected_dims}D shape {ref_log_prob.shape}")
+                                    logger.info(f"✓ VERIFIED: old_log_probs has correct {expected_dims}D shape {old_log_probs.shape}")
+                            
                             batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                batch,
+                                kl_ctrl=self.kl_ctrl_in_reward,
+                                kl_penalty=self.config.algorithm.kl_penalty,
+                                config=self.config.algorithm
                             )
                             metrics.update(kl_metrics)
                         else:

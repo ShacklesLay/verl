@@ -1,4 +1,10 @@
-
+.sii/
+*.md
+__MACOSX/
+rl/
+tensorboard_log/
+qwen2.5*
+*.patch
 **/*.pt
 **/checkpoints
 **/wget-log

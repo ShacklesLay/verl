@@ -75,7 +75,8 @@ class ActorConfig(BaseConfig):
         use_kl_loss (bool): Whether to use KL divergence loss.
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
-        kl_loss_type (str): Type of KL loss to use.
+        kl_loss_type (str): Type of KL loss to use. Options: 'kl', 'low_var_kl', 'full', 'top-k', 'top-k-unnorm'.
+        kl_topk_size (Optional[int]): Number of top tokens for top-k KL computation. Required when kl_loss_type is 'top-k' or 'top-k-unnorm'.
         ppo_epochs (int): Number of PPO epochs per training step.
         shuffle (bool): Whether to shuffle data during training.
         checkpoint (CheckpointConfig): Configuration for checkpointing.
@@ -110,6 +111,7 @@ class ActorConfig(BaseConfig):
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
+    kl_topk_size: Optional[int] = None
     ppo_epochs: int = 1
     shuffle: bool = False
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -146,6 +148,13 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        
+        # Validate kl_topk_size for top-k KL loss types
+        if self.use_kl_loss and self.kl_loss_type in ("top-k", "top-k-unnorm") and self.kl_topk_size is None:
+            raise ValueError(
+                f"[actor] kl_loss_type='{self.kl_loss_type}' requires kl_topk_size to be set. "
+                f"Please set actor_rollout_ref.actor.kl_topk_size=<value>."
+            )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
